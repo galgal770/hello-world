@@ -167,37 +167,119 @@ def load_image_pattern(image_path, invert=False):
 
 # ── SVG generation ────────────────────────────────────────────────────────────
 
+def _handle_outline_path(disk_cx, disk_cy, disk_r, bulb_cx, bulb_cy, bulb_r,
+                         disk_angle_deg=35, bulb_angle_deg=72, waist_pull=0.18):
+    """Return an SVG <path d="..."> string for the paddle outline:
+    a disk on the right, a small bulb on the left, joined by a smooth waist.
+
+    disk_angle_deg / bulb_angle_deg are angles from vertical at the
+    connection points: smaller → connection nearer the top/bottom of the
+    lobe (wider attachment); 90° → equator (narrowest).  The defaults give
+    a wide, generous attachment on the disk and a moderate one on the bulb.
+
+    waist_pull controls how much the cubic Bézier control points are
+    drawn toward the centre line, creating the gentle inward waist.
+    """
+    a = math.radians(disk_angle_deg)
+    b = math.radians(bulb_angle_deg)
+
+    # Tangent (connection) points on the disk — its left side, facing the bulb
+    dtx = disk_cx - disk_r * math.sin(a)
+    dty_top = disk_cy - disk_r * math.cos(a)
+    dty_bot = disk_cy + disk_r * math.cos(a)
+
+    # Tangent (connection) points on the bulb — its right side, facing the disk
+    btx = bulb_cx + bulb_r * math.sin(b)
+    bty_top = bulb_cy - bulb_r * math.cos(b)
+    bty_bot = bulb_cy + bulb_r * math.cos(b)
+
+    span = dtx - btx
+
+    # Cubic control points: 1/3 and 2/3 along the line between endpoints,
+    # each pulled `waist_pull` of the way toward the centre line so the
+    # curve dips gently inward in the middle.
+    def _ctrl(t, y_a, y_b, x_a):
+        x = x_a + span * t
+        y_lin = y_a + (y_b - y_a) * t
+        y = y_lin + (disk_cy - y_lin) * waist_pull
+        return (x, y)
+
+    cp1_top = _ctrl(0.33, bty_top, dty_top, btx)
+    cp2_top = _ctrl(0.67, bty_top, dty_top, btx)
+    # Bottom mirror — go from disk to bulb (path direction reverses on the way back)
+    cp1_bot = _ctrl(0.33, dty_bot, bty_bot, dtx, )
+    cp2_bot = _ctrl(0.67, dty_bot, bty_bot, dtx, )
+    # _ctrl uses span as (dtx - btx); when going disk → bulb we negate it.
+    cp1_bot = (dtx - span * 0.33, cp1_bot[1])
+    cp2_bot = (dtx - span * 0.67, cp2_bot[1])
+
+    # SVG arc flags: large-arc=1 (we want >180° around each circle),
+    # sweep=1 (clockwise in SVG's y-down coords).
+    return (
+        f"M {btx:.3f} {bty_top:.3f} "
+        f"C {cp1_top[0]:.3f} {cp1_top[1]:.3f}, "
+        f"{cp2_top[0]:.3f} {cp2_top[1]:.3f}, "
+        f"{dtx:.3f} {dty_top:.3f} "
+        f"A {disk_r:.3f} {disk_r:.3f} 0 1 1 {dtx:.3f} {dty_bot:.3f} "
+        f"C {cp1_bot[0]:.3f} {cp1_bot[1]:.3f}, "
+        f"{cp2_bot[0]:.3f} {cp2_bot[1]:.3f}, "
+        f"{btx:.3f} {bty_bot:.3f} "
+        f"A {bulb_r:.3f} {bulb_r:.3f} 0 1 1 {btx:.3f} {bty_top:.3f} "
+        f"Z"
+    )
+
+
 def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
-                 max_fill=0.20):
+                 max_fill=0.20, handle=False, total_width_mm=None,
+                 bulb_diameter_mm=None):
     """Build SVG text for the stencil.
 
     Parameters
     ----------
-    pattern_fn   : callable(nx, ny) -> bool
-    diameter_mm  : outer diameter of the wooden disk in mm
-    grid_n       : number of grid cells across the full diameter
-    hole_d_mm    : requested hole diameter in mm; auto-scaled down if needed
-    max_fill     : maximum fraction of disk area that may be holes (default 0.20).
-                   Keeps cinnamon throughput to a light, photogenic dusting.
-                   Set to None to disable the cap.
+    pattern_fn       : callable(nx, ny) -> bool
+    diameter_mm      : outer diameter of the wooden disk in mm
+    grid_n           : number of grid cells across the full diameter
+    hole_d_mm        : requested hole diameter in mm; auto-scaled down if needed
+    max_fill         : maximum fraction of disk area that may be holes (default 0.20)
+    handle           : if True, add a paddle handle to the left of the disk
+    total_width_mm   : total outline width (disk + handle).  Defaults to
+                       diameter_mm + 51 to match a 95→146 mm reference design.
+    bulb_diameter_mm : handle-end bulb diameter.  Defaults to ~26 % of the disk
+                       diameter (≈25 mm for a 95 mm disk).
 
     Returns
     -------
     svg_text      : str
     n_holes       : int
-    fill_ratio    : float   – actual fraction of disk area occupied by holes
-    actual_hole_d : float   – hole diameter used (may be < hole_d_mm if capped)
+    fill_ratio    : float
+    actual_hole_d : float
     """
     radius_mm = diameter_mm / 2.0
     disk_area = math.pi * radius_mm ** 2
     cell      = diameter_mm / grid_n
     hole_r    = hole_d_mm / 2.0
 
-    pad    = 6.0
-    canvas = diameter_mm + 2 * pad
-    cx = cy = canvas / 2.0
+    pad = 6.0
 
-    # Collect hole centres using the requested hole_r for the margin check.
+    # ── Canvas + disk/bulb placement ─────────────────────────────────────────
+    if handle:
+        if total_width_mm is None:
+            total_width_mm = diameter_mm + 51.0          # 95 → 146 mm reference
+        if bulb_diameter_mm is None:
+            bulb_diameter_mm = diameter_mm * 0.263       # ≈25 mm for 95 mm disk
+        bulb_r   = bulb_diameter_mm / 2.0
+        canvas_w = total_width_mm + 2 * pad
+        canvas_h = diameter_mm   + 2 * pad
+        disk_cy  = canvas_h / 2.0
+        disk_cx  = canvas_w - pad - radius_mm
+        bulb_cx  = pad + bulb_r
+        bulb_cy  = canvas_h / 2.0
+    else:
+        canvas_w = canvas_h = diameter_mm + 2 * pad
+        disk_cx  = disk_cy  = canvas_w / 2.0
+        bulb_r   = None
+
+    # Collect hole centres — holes live ONLY inside the disk, never the handle.
     hole_centres = []
     for row in range(grid_n):
         for col in range(grid_n):
@@ -208,7 +290,7 @@ def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
             nx = mx / radius_mm
             ny = my / radius_mm
             if pattern_fn(nx, ny):
-                hole_centres.append((cx + mx, cy + my))
+                hole_centres.append((disk_cx + mx, disk_cy + my))
 
     n_holes = len(hole_centres)
 
@@ -225,19 +307,31 @@ def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
     # ── SVG assembly ──────────────────────────────────────────────────────────
     cinnamon_g = fill_ratio * 3.0   # fraction of ~1 tsp (3 g) that falls through
 
+    if handle:
+        outline_svg = (
+            f'  <path d="{_handle_outline_path(disk_cx, disk_cy, radius_mm, bulb_cx, bulb_cy, bulb_r)}"\n'
+            '        fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        )
+        size_note = f"{total_width_mm}×{diameter_mm} mm paddle"
+    else:
+        outline_svg = (
+            f'  <circle cx="{disk_cx}" cy="{disk_cy}" r="{radius_mm}"\n'
+            '          fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        )
+        size_note = f"⌀{diameter_mm} mm disk"
+
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
-        f'<!-- Coffee Stencil  |  ⌀{diameter_mm} mm  |  {n_holes} holes'
+        f'<!-- Coffee Stencil  |  {size_note}  |  {n_holes} holes'
         f'  |  fill {fill_ratio*100:.1f}%  |  ~{cinnamon_g:.1f} g cinnamon -->',
         f'<!-- Generated by stencil_generator.py -->',
         '<svg xmlns="http://www.w3.org/2000/svg"',
-        f'     width="{canvas}mm" height="{canvas}mm"',
-        f'     viewBox="0 0 {canvas} {canvas}">',
-        f'  <title>Coffee Stencil – {diameter_mm} mm disk</title>',
+        f'     width="{canvas_w}mm" height="{canvas_h}mm"',
+        f'     viewBox="0 0 {canvas_w} {canvas_h}">',
+        f'  <title>Coffee Stencil – {size_note}</title>',
         '',
-        '  <!-- Plate outline: RED = cut/score the disk perimeter -->',
-        f'  <circle cx="{cx}" cy="{cy}" r="{radius_mm}"',
-        '          fill="none" stroke="#ff0000" stroke-width="0.3"/>',
+        '  <!-- Outline: RED = laser-cut / score this line -->',
+        outline_svg,
         '',
         '  <!-- Holes: BLUE = cut/drill through -->',
         f'  <g fill="#0000ff" stroke="none">',
@@ -249,10 +343,10 @@ def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
     lines += [
         '  </g>',
         '',
-        f'  <text x="{cx}" y="{canvas - 1.5}"',
+        f'  <text x="{disk_cx}" y="{canvas_h - 1.5}"',
         '        text-anchor="middle" font-family="sans-serif"',
         '        font-size="2.5" fill="#999999">',
-        f'    ⌀{diameter_mm} mm · {n_holes} holes · hole ⌀{actual_hole_d:.2f} mm'
+        f'    {size_note} · {n_holes} holes · hole ⌀{actual_hole_d:.2f} mm'
         f' · fill {fill_ratio*100:.1f}% · ~{cinnamon_g:.1f} g cinnamon',
         '  </text>',
         '</svg>',
@@ -329,6 +423,21 @@ def main():
              "cinnamon throughput to a light, photogenic dusting (~0.6 g at 20%%).",
     )
     parser.add_argument(
+        "--handle", action="store_true",
+        help="Add a paddle handle to the left of the disk (95→146 mm reference "
+             "shape: round disk + small teardrop bulb joined by a smooth waist).",
+    )
+    parser.add_argument(
+        "--total-width", dest="total_width", type=float, default=None, metavar="MM",
+        help="Total outline width (disk + handle).  Only used with --handle. "
+             "Defaults to diameter + 51 mm.",
+    )
+    parser.add_argument(
+        "--bulb-diameter", dest="bulb_d", type=float, default=None, metavar="MM",
+        help="Handle-end bulb diameter.  Only used with --handle. "
+             "Defaults to ~26%% of disk diameter.",
+    )
+    parser.add_argument(
         "--output", "-o", metavar="FILE",
         help="Output SVG filename (default: <pattern>_stencil.svg)",
     )
@@ -369,6 +478,9 @@ def main():
         grid_n=args.grid,
         hole_d_mm=args.hole_d,
         max_fill=args.max_fill,
+        handle=args.handle,
+        total_width_mm=args.total_width,
+        bulb_diameter_mm=args.bulb_d,
     )
 
     with open(out_path, "w", encoding="utf-8") as fh:
