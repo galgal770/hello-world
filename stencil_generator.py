@@ -168,51 +168,47 @@ def load_image_pattern(image_path, invert=False):
 # ── SVG generation ────────────────────────────────────────────────────────────
 
 def _handle_outline_path(disk_cx, disk_cy, disk_r, bulb_cx, bulb_cy, bulb_r,
-                         disk_angle_deg=73, bulb_angle_deg=38, waist_pull=0.05):
-    """Return an SVG <path d="..."> string for a ping-pong-racket outline:
-    a round disk on the right, a chunky teardrop handle on the left.
+                         disk_angle_deg=73, bulb_angle_deg=38):
+    """Return an SVG <path d="..."> string for a ping-pong-racket outline.
 
-    disk_angle_deg / bulb_angle_deg are angles from vertical at the
-    connection points (90° = equator, 0° = top).  Defaults give a handle
-    roughly as wide as the bulb itself, with near-parallel sides — the
-    classic paddle-grip look.  waist_pull is small so the handle stays
-    mostly uniform-width rather than pinching in the middle.
+    G1 continuity at every junction: Bezier control points lie along the
+    circle tangent so the path flows without kinks or corners.
+
+    In SVG y-down coords the CW tangent at a point with outward unit radius
+    u = (ux, uy) is t = (-uy, ux).  This gives:
+      disk  upper connection (angle a from vertical): t = ( cos a, -sin a)
+      disk  lower connection:                         t = (-cos a, -sin a)
+      bulb  upper connection (angle b from vertical): t = ( cos b,  sin b)
+      bulb  lower connection:                         t = (-cos b,  sin b)
+    Control points are placed 0.40 x chord-length along these tangents.
     """
     a = math.radians(disk_angle_deg)
     b = math.radians(bulb_angle_deg)
 
-    # Tangent (connection) points on the disk — its left side, facing the bulb
-    dtx = disk_cx - disk_r * math.sin(a)
+    # Connection points on the disk (left side)
+    dtx     = disk_cx - disk_r * math.sin(a)
     dty_top = disk_cy - disk_r * math.cos(a)
     dty_bot = disk_cy + disk_r * math.cos(a)
 
-    # Tangent (connection) points on the bulb — its right side, facing the disk
-    btx = bulb_cx + bulb_r * math.sin(b)
+    # Connection points on the bulb (right side)
+    btx     = bulb_cx + bulb_r * math.sin(b)
     bty_top = bulb_cy - bulb_r * math.cos(b)
     bty_bot = bulb_cy + bulb_r * math.cos(b)
 
-    span = dtx - btx
+    d_top = 0.40 * math.hypot(dtx - btx, dty_top - bty_top)
+    d_bot = 0.40 * math.hypot(dtx - btx, dty_bot - bty_bot)
 
-    # Cubic control points: 1/3 and 2/3 along the line between endpoints,
-    # each pulled `waist_pull` of the way toward the centre line so the
-    # curve dips gently inward in the middle.
-    def _ctrl(t, y_a, y_b, x_a):
-        x = x_a + span * t
-        y_lin = y_a + (y_b - y_a) * t
-        y = y_lin + (disk_cy - y_lin) * waist_pull
-        return (x, y)
+    # TOP edge  bulb→disk  (arc just left bulb going (cos b, sin b); disk arc
+    # will depart going (cos a, -sin a))
+    cp1_top = (btx + d_top * math.cos(b), bty_top + d_top * math.sin(b))
+    cp2_top = (dtx - d_top * math.cos(a), dty_top + d_top * math.sin(a))
 
-    cp1_top = _ctrl(0.33, bty_top, dty_top, btx)
-    cp2_top = _ctrl(0.67, bty_top, dty_top, btx)
-    # Bottom mirror — go from disk to bulb (path direction reverses on the way back)
-    cp1_bot = _ctrl(0.33, dty_bot, bty_bot, dtx, )
-    cp2_bot = _ctrl(0.67, dty_bot, bty_bot, dtx, )
-    # _ctrl uses span as (dtx - btx); when going disk → bulb we negate it.
-    cp1_bot = (dtx - span * 0.33, cp1_bot[1])
-    cp2_bot = (dtx - span * 0.67, cp2_bot[1])
+    # BOTTOM edge  disk→bulb  (disk arc just arrived going (-cos a, -sin a);
+    # bulb arc will depart going (-cos b, sin b))
+    cp1_bot = (dtx - d_bot * math.cos(a), dty_bot - d_bot * math.sin(a))
+    cp2_bot = (btx + d_bot * math.cos(b), bty_bot - d_bot * math.sin(b))
 
-    # SVG arc flags: large-arc=1 (we want >180° around each circle),
-    # sweep=1 (clockwise in SVG's y-down coords).
+    # large-arc=1, sweep=1 → CW arc >180° (right half of disk, left cap of bulb)
     return (
         f"M {btx:.3f} {bty_top:.3f} "
         f"C {cp1_top[0]:.3f} {cp1_top[1]:.3f}, "
