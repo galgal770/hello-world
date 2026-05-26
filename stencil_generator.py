@@ -168,17 +168,15 @@ def load_image_pattern(image_path, invert=False):
 # ── SVG generation ────────────────────────────────────────────────────────────
 
 def _handle_outline_path(disk_cx, disk_cy, disk_r, bulb_cx, bulb_cy, bulb_r,
-                         disk_angle_deg=35, bulb_angle_deg=72, waist_pull=0.18):
-    """Return an SVG <path d="..."> string for the paddle outline:
-    a disk on the right, a small bulb on the left, joined by a smooth waist.
+                         disk_angle_deg=73, bulb_angle_deg=38, waist_pull=0.05):
+    """Return an SVG <path d="..."> string for a ping-pong-racket outline:
+    a round disk on the right, a chunky teardrop handle on the left.
 
     disk_angle_deg / bulb_angle_deg are angles from vertical at the
-    connection points: smaller → connection nearer the top/bottom of the
-    lobe (wider attachment); 90° → equator (narrowest).  The defaults give
-    a wide, generous attachment on the disk and a moderate one on the bulb.
-
-    waist_pull controls how much the cubic Bézier control points are
-    drawn toward the centre line, creating the gentle inward waist.
+    connection points (90° = equator, 0° = top).  Defaults give a handle
+    roughly as wide as the bulb itself, with near-parallel sides — the
+    classic paddle-grip look.  waist_pull is small so the handle stays
+    mostly uniform-width rather than pinching in the middle.
     """
     a = math.radians(disk_angle_deg)
     b = math.radians(bulb_angle_deg)
@@ -266,7 +264,7 @@ def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
         if total_width_mm is None:
             total_width_mm = diameter_mm + 51.0          # 95 → 146 mm reference
         if bulb_diameter_mm is None:
-            bulb_diameter_mm = diameter_mm * 0.263       # ≈25 mm for 95 mm disk
+            bulb_diameter_mm = diameter_mm * 0.295       # ≈28 mm for 95 mm disk
         bulb_r   = bulb_diameter_mm / 2.0
         canvas_w = total_width_mm + 2 * pad
         canvas_h = diameter_mm   + 2 * pad
