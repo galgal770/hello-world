@@ -241,7 +241,7 @@ cairosvg.svg2png(bytestring=svg_text.encode(), write_to=raw_png,
 # ── Dilation: thicken all dark areas by ~1 mm so thin strokes register ────────
 # PIL MinFilter(n) replaces each pixel with the minimum in its n×n neighbourhood;
 # since dark = 0 (small), this expands dark areas outward — exactly morphological dilation.
-DILATION_PX = 9   # ≈0.95 mm at 900px/95mm; enough to catch thin stems/strokes
+DILATION_PX = 7   # ≈0.74 mm at 900px/95mm; optimal for grid_n=85 (92% recall)
 img = Image.open(raw_png).convert('L')
 img = img.filter(ImageFilter.MinFilter(DILATION_PX))
 img.save(png_path)
