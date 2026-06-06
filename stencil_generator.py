@@ -29,6 +29,7 @@ import math
 import argparse
 import sys
 import os
+from collections import deque, defaultdict
 
 # ── Built-in pattern functions ────────────────────────────────────────────────
 # Each receives (nx, ny) in normalised [-1, 1] space where the disk has r = 1.
@@ -223,6 +224,386 @@ def _handle_outline_path(disk_cx, disk_cy, disk_r, bulb_cx, bulb_cy, bulb_r,
     )
 
 
+# ── Cutout (contour) mode ──────────────────────────────────────────────────────
+# Instead of approximating the design with a grid of round holes, this mode cuts
+# the solid dark areas out as real contours.  Closed shapes (the inside of an
+# "o", a cup interior, a coffee-bean groove) would otherwise drop out as loose
+# islands, so we detect every such island and carve a thin bridge of material
+# back to the surrounding disk — exactly how a paper/laser stencil keeps its
+# counters attached.
+
+def _content_transform(img, target_frac=0.85):
+    """Find the dark content's centre and the scale that makes it fill
+    `target_frac` of the disk radius.  Returns (cx, cy, scale) in the image's
+    normalised [-1, 1] space.  Used to centre any image inside the big circle.
+    """
+    w, h = img.size
+    px = img.load()
+    minx = miny = 1e9
+    maxx = maxy = -1e9
+    step = max(1, min(w, h) // 400)
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            if px[x, y] < 128:
+                nx = x / w * 2 - 1
+                ny = y / h * 2 - 1
+                minx = min(minx, nx); maxx = max(maxx, nx)
+                miny = min(miny, ny); maxy = max(maxy, ny)
+    if maxx < minx:                       # no dark pixels
+        return 0.0, 0.0, 1.0
+    cx = (minx + maxx) / 2.0
+    cy = (miny + maxy) / 2.0
+    rad = 0.0
+    for y in range(0, h, step):
+        for x in range(0, w, step):
+            if px[x, y] < 128:
+                nx = x / w * 2 - 1
+                ny = y / h * 2 - 1
+                rad = max(rad, math.hypot(nx - cx, ny - cy))
+    scale = target_frac / rad if rad > 0 else 1.0
+    return cx, cy, scale
+
+
+def make_image_sampler(image_path, invert=False, content_frac=0.85):
+    """Return (sampler, transform) where sampler(dx, dy) -> bool says whether the
+    centred/scaled image is dark at disk-normalised coords (dx, dy) ∈ [-1, 1]."""
+    try:
+        from PIL import Image
+    except ImportError:
+        sys.exit("ERROR: Pillow is required for --image mode.  pip install Pillow")
+
+    img = Image.open(image_path).convert("L")
+    w, h = img.size
+    px = img.load()
+    cx, cy, scale = _content_transform(img, content_frac)
+
+    def sampler(dx, dy):
+        sx = cx + dx / scale
+        sy = cy + dy / scale
+        if not (-1.0 <= sx <= 1.0 and -1.0 <= sy <= 1.0):
+            return False
+        ix = min(w - 1, max(0, int((sx + 1) / 2 * w)))
+        iy = min(h - 1, max(0, int((sy + 1) / 2 * h)))
+        return (px[ix, iy] < 128) != invert
+
+    return sampler, (cx, cy, scale)
+
+
+def _build_cut_mask(grid_n, sampler):
+    """Sample the design onto a grid_n×grid_n boolean mask (True = cut)."""
+    mask   = [[False] * grid_n for _ in range(grid_n)]
+    inside = [[False] * grid_n for _ in range(grid_n)]
+    for r in range(grid_n):
+        dy = (r + 0.5) / grid_n * 2 - 1
+        for c in range(grid_n):
+            dx = (c + 0.5) / grid_n * 2 - 1
+            if dx * dx + dy * dy <= 1.0:
+                inside[r][c] = True
+                if sampler(dx, dy):
+                    mask[r][c] = True
+    return mask, inside
+
+
+def _remove_small(mask, inside, grid_n, min_cells):
+    """Drop dark specks smaller than `min_cells` (8-connected)."""
+    seen = [[False] * grid_n for _ in range(grid_n)]
+    for r in range(grid_n):
+        for c in range(grid_n):
+            if not mask[r][c] or seen[r][c]:
+                continue
+            comp = []
+            dq = deque([(r, c)])
+            seen[r][c] = True
+            while dq:
+                y, x = dq.popleft()
+                comp.append((y, x))
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        ny, nx = y + dy, x + dx
+                        if (0 <= ny < grid_n and 0 <= nx < grid_n
+                                and mask[ny][nx] and not seen[ny][nx]):
+                            seen[ny][nx] = True
+                            dq.append((ny, nx))
+            if len(comp) < min_cells:
+                for (y, x) in comp:
+                    mask[y][x] = False
+
+
+def _anchor_white(mask, inside, grid_n):
+    """Flag every 'kept' white cell connected to the disk rim (anchored
+    material).  White cells NOT reachable from the rim are islands."""
+    anchored = [[False] * grid_n for _ in range(grid_n)]
+    dq = deque()
+    for r in range(grid_n):
+        for c in range(grid_n):
+            if not inside[r][c] or mask[r][c]:
+                continue
+            rim = (r == 0 or c == 0 or r == grid_n - 1 or c == grid_n - 1
+                   or not inside[r - 1][c] or not inside[r + 1][c]
+                   or not inside[r][c - 1] or not inside[r][c + 1])
+            if rim and not anchored[r][c]:
+                anchored[r][c] = True
+                dq.append((r, c))
+    while dq:
+        r, c = dq.popleft()
+        for dr, dc in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            nr, nc = r + dr, c + dc
+            if (0 <= nr < grid_n and 0 <= nc < grid_n and inside[nr][nc]
+                    and not mask[nr][nc] and not anchored[nr][nc]):
+                anchored[nr][nc] = True
+                dq.append((nr, nc))
+    return anchored
+
+
+def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
+    """Carve a thin material bridge from every white island to the nearest
+    anchored white cell, so closed counters stay attached.  Mutates `mask`
+    (carved cells become white) and `anchored`.  Returns the bridge count."""
+    half = max(0, bridge_cells // 2)
+
+    def carve(r, c):
+        for dr in range(-half, half + 1):
+            for dc in range(-half, half + 1):
+                nr, nc = r + dr, c + dc
+                if 0 <= nr < grid_n and 0 <= nc < grid_n and inside[nr][nc]:
+                    mask[nr][nc] = False
+                    anchored[nr][nc] = True
+
+    seen = [[False] * grid_n for _ in range(grid_n)]
+    n_bridges = 0
+    for r0 in range(grid_n):
+        for c0 in range(grid_n):
+            if (not inside[r0][c0] or mask[r0][c0] or anchored[r0][c0]
+                    or seen[r0][c0]):
+                continue
+            # Collect this island (4-connected white, not anchored)
+            island = []
+            dq = deque([(r0, c0)])
+            seen[r0][c0] = True
+            while dq:
+                y, x = dq.popleft()
+                island.append((y, x))
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if (0 <= ny < grid_n and 0 <= nx < grid_n and inside[ny][nx]
+                            and not mask[ny][nx] and not anchored[ny][nx]
+                            and not seen[ny][nx]):
+                        seen[ny][nx] = True
+                        dq.append((ny, nx))
+
+            # BFS through the grid from the island to the nearest anchored cell
+            parent = {}
+            frontier = deque()
+            for cell in island:
+                parent[cell] = None
+                frontier.append(cell)
+            target = None
+            while frontier and target is None:
+                y, x = frontier.popleft()
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if not (0 <= ny < grid_n and 0 <= nx < grid_n) or not inside[ny][nx]:
+                        continue
+                    if (ny, nx) in parent:
+                        continue
+                    parent[(ny, nx)] = (y, x)
+                    if anchored[ny][nx]:
+                        target = (ny, nx)
+                        break
+                    frontier.append((ny, nx))
+
+            # Carve the path (target → island) and the island itself
+            if target is not None:
+                node = target
+                while node is not None:
+                    carve(*node)
+                    node = parent[node]
+                n_bridges += 1
+            for (y, x) in island:        # island is kept material now
+                anchored[y][x] = True
+    return n_bridges
+
+
+def _extract_loops(mask, inside, grid_n):
+    """Trace the boundary of the cut region as closed corner loops using
+    marching-squares edge segments chained together."""
+    def D(r, c):
+        return 0 <= r < grid_n and 0 <= c < grid_n and inside[r][c] and mask[r][c]
+
+    adj = defaultdict(list)
+    def seg(p, q):
+        adj[p].append(q)
+        adj[q].append(p)
+
+    for r in range(grid_n):
+        for c in range(grid_n):
+            if not D(r, c):
+                continue
+            if not D(r - 1, c): seg((c, r),     (c + 1, r))
+            if not D(r + 1, c): seg((c, r + 1), (c + 1, r + 1))
+            if not D(r, c - 1): seg((c, r),     (c, r + 1))
+            if not D(r, c + 1): seg((c + 1, r), (c + 1, r + 1))
+
+    loops = []
+    while adj:
+        start = next(iter(adj))
+        if not adj[start]:
+            del adj[start]
+            continue
+        loop = [start]
+        cur, prev = start, None
+        while True:
+            nbrs = adj[cur]
+            nxt = next((p for p in nbrs if p != prev), nbrs[0])
+            adj[cur].remove(nxt)
+            adj[nxt].remove(cur)
+            if not adj[cur]:
+                del adj[cur]
+            prev, cur = cur, nxt
+            if cur == start:
+                break
+            loop.append(cur)
+        adj.pop(start, None)
+        if len(loop) >= 4:
+            loops.append(loop)
+    return loops
+
+
+def _chaikin(pts, iters=2):
+    """Corner-cutting smoothing of a closed polygon (staircase → soft curve)."""
+    for _ in range(iters):
+        out = []
+        n = len(pts)
+        for i in range(n):
+            (px, py), (qx, qy) = pts[i], pts[(i + 1) % n]
+            out.append((0.75 * px + 0.25 * qx, 0.75 * py + 0.25 * qy))
+            out.append((0.25 * px + 0.75 * qx, 0.25 * py + 0.75 * qy))
+        pts = out
+    return pts
+
+
+def _cut_agreement(sampler, mask, grid_n, fine=400):
+    """Recall/precision of the cut region vs. the original design (in-disk)."""
+    cov = orig = cut = 0
+    for j in range(fine):
+        dy = (j + 0.5) / fine * 2 - 1
+        for i in range(fine):
+            dx = (i + 0.5) / fine * 2 - 1
+            if dx * dx + dy * dy > 1.0:
+                continue
+            o = sampler(dx, dy)
+            r = min(grid_n - 1, max(0, int((dy + 1) / 2 * grid_n)))
+            c = min(grid_n - 1, max(0, int((dx + 1) / 2 * grid_n)))
+            m = mask[r][c]
+            if o:        orig += 1
+            if m:        cut  += 1
+            if o and m:  cov  += 1
+    recall = cov / orig if orig else 0.0
+    prec   = cov / cut  if cut  else 0.0
+    return recall, prec
+
+
+def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
+                        handle=False, total_width_mm=None, bulb_diameter_mm=None):
+    """Build SVG text for a contour-cut stencil (solid areas cut out, with
+    auto-bridges holding every closed counter).  The design is centred in the
+    big disk by the sampler's own transform.
+
+    Returns (svg_text, n_loops, fill_ratio, n_bridges, recall, precision).
+    """
+    radius_mm = diameter_mm / 2.0
+    disk_area = math.pi * radius_mm ** 2
+    cell_mm   = diameter_mm / grid_n
+    pad = 6.0
+
+    # ── Canvas + disk/bulb placement (mirrors generate_svg) ──────────────────
+    if handle:
+        if total_width_mm is None:
+            total_width_mm = diameter_mm + 51.0
+        if bulb_diameter_mm is None:
+            bulb_diameter_mm = diameter_mm * 0.295
+        bulb_r   = bulb_diameter_mm / 2.0
+        canvas_w = total_width_mm + 2 * pad
+        canvas_h = diameter_mm + 2 * pad
+        disk_cy  = canvas_h / 2.0
+        disk_cx  = canvas_w - pad - radius_mm
+        bulb_cx  = pad + bulb_r
+        bulb_cy  = canvas_h / 2.0
+    else:
+        canvas_w = canvas_h = diameter_mm + 2 * pad
+        disk_cx  = disk_cy = canvas_w / 2.0
+        bulb_r   = None
+
+    # ── Mask → islands → bridges → contours ──────────────────────────────────
+    mask, inside = _build_cut_mask(grid_n, sampler)
+    _remove_small(mask, inside, grid_n, min_cells=3)
+    anchored     = _anchor_white(mask, inside, grid_n)
+    bridge_cells = max(2, round(bridge_mm / cell_mm))
+    n_bridges    = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
+    loops        = _extract_loops(mask, inside, grid_n)
+
+    def corner_mm(X, Y):
+        dx = X / grid_n * 2 - 1
+        dy = Y / grid_n * 2 - 1
+        return (disk_cx + dx * radius_mm, disk_cy + dy * radius_mm)
+
+    subpaths = []
+    for loop in loops:
+        pts = _chaikin([corner_mm(X, Y) for (X, Y) in loop], iters=2)
+        d = "M " + f"{pts[0][0]:.3f} {pts[0][1]:.3f} " + " ".join(
+            f"L {x:.3f} {y:.3f}" for x, y in pts[1:]) + " Z"
+        subpaths.append(d)
+    cut_d = " ".join(subpaths)
+
+    n_cells    = sum(1 for r in range(grid_n) for c in range(grid_n) if mask[r][c])
+    fill_ratio = n_cells * cell_mm ** 2 / disk_area
+    recall, precision = _cut_agreement(sampler, mask, grid_n)
+    cinnamon_g = fill_ratio * 3.0
+
+    # ── SVG assembly ─────────────────────────────────────────────────────────
+    if handle:
+        outline_svg = (
+            f'  <path d="{_handle_outline_path(disk_cx, disk_cy, radius_mm, bulb_cx, bulb_cy, bulb_r)}"\n'
+            '        fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        )
+        size_note = f"{total_width_mm}×{diameter_mm} mm paddle"
+    else:
+        outline_svg = (
+            f'  <circle cx="{disk_cx}" cy="{disk_cy}" r="{radius_mm}"\n'
+            '          fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        )
+        size_note = f"⌀{diameter_mm} mm disk"
+
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        f'<!-- Coffee Stencil (cutout)  |  {size_note}  |  {len(loops)} cut shapes'
+        f'  |  {n_bridges} bridges  |  fill {fill_ratio*100:.1f}%'
+        f'  |  agree {recall*100:.1f}% -->',
+        '<!-- Generated by stencil_generator.py (contour cutout mode) -->',
+        '<svg xmlns="http://www.w3.org/2000/svg"',
+        f'     width="{canvas_w}mm" height="{canvas_h}mm"',
+        f'     viewBox="0 0 {canvas_w} {canvas_h}">',
+        f'  <title>Coffee Stencil – {size_note} (cutout)</title>',
+        '',
+        '  <!-- Outline: RED = laser-cut / score this line -->',
+        outline_svg,
+        '',
+        '  <!-- Cut regions: RED outline = cut path, BLUE fill = removed material -->',
+        f'  <path d="{cut_d}"',
+        '        fill="#0000ff" fill-opacity="0.85" fill-rule="evenodd"',
+        '        stroke="#ff0000" stroke-width="0.25"/>',
+        '',
+        f'  <text x="{disk_cx}" y="{canvas_h - 1.5}"',
+        '        text-anchor="middle" font-family="sans-serif"',
+        '        font-size="2.5" fill="#999999">',
+        f'    {size_note} · {len(loops)} shapes · {n_bridges} bridges'
+        f' · fill {fill_ratio*100:.1f}% · agree {recall*100:.1f}% · ~{cinnamon_g:.1f} g cinnamon',
+        '  </text>',
+        '</svg>',
+    ]
+    return '\n'.join(lines), len(loops), fill_ratio, n_bridges, recall, precision
+
+
 def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
                  max_fill=0.20, handle=False, total_width_mm=None,
                  bulb_diameter_mm=None):
@@ -374,6 +755,10 @@ def main():
               # Custom image (requires Pillow)
               python stencil_generator.py --image logo.png --invert --diameter 90
 
+              # Contour CUTOUT mode: cut solid shapes (with auto-bridges),
+              # design auto-centred in the disk
+              python stencil_generator.py --image logo.png --cutout --handle
+
               # List all built-in patterns
               python stencil_generator.py --list-patterns
         """),
@@ -398,9 +783,9 @@ def main():
         help="Outer disk diameter in mm (default: 90)",
     )
     parser.add_argument(
-        "--grid", type=int, default=40, metavar="N",
-        help="Grid resolution – cells across the diameter (default: 40).  "
-             "Higher = finer detail, more holes.",
+        "--grid", type=int, default=None, metavar="N",
+        help="Grid resolution – cells across the diameter.  Default 40 in holes "
+             "mode, 300 in --cutout mode.  Higher = finer detail.",
     )
     parser.add_argument(
         "--hole-diameter", dest="hole_d", type=float, default=1.5, metavar="MM",
@@ -432,6 +817,24 @@ def main():
              "Defaults to ~26%% of disk diameter.",
     )
     parser.add_argument(
+        "--cutout", action="store_true",
+        help="Contour-cut mode: cut the solid dark areas out as real shapes "
+             "(with auto-bridges holding every closed counter) instead of "
+             "approximating the design with a grid of round holes.  The design "
+             "is auto-centred in the disk.",
+    )
+    parser.add_argument(
+        "--bridge-width", dest="bridge_mm", type=float, default=1.6, metavar="MM",
+        help="Width of the material bridges that hold cut-out islands in place "
+             "(only used with --cutout, default: 1.6).",
+    )
+    parser.add_argument(
+        "--content-scale", dest="content_frac", type=float, default=0.85,
+        metavar="FRAC",
+        help="Fraction of the disk radius the design fills when auto-centred "
+             "(only used with --cutout + --image, default: 0.85).",
+    )
+    parser.add_argument(
         "--output", "-o", metavar="FILE",
         help="Output SVG filename (default: <pattern>_stencil.svg)",
     )
@@ -449,27 +852,65 @@ def main():
     if args.pattern is None and args.image is None:
         parser.error("Specify --pattern <name> or --image <file> (or --list-patterns).")
 
-    # Build the pattern function
     if args.image:
-        pattern_fn  = load_image_pattern(args.image, invert=args.invert)
         default_out = os.path.splitext(os.path.basename(args.image))[0] + "_stencil.svg"
         label       = os.path.basename(args.image)
+    else:
+        default_out = f"{args.pattern}_stencil.svg"
+        label       = args.pattern
+    out_path = args.output or default_out
+
+    # ── Cutout (contour) mode ────────────────────────────────────────────────
+    if args.cutout:
+        grid_n = args.grid or 300
+        if args.image:
+            sampler, (cx, cy, scale) = make_image_sampler(
+                args.image, invert=args.invert, content_frac=args.content_frac)
+        else:
+            base_fn = PATTERNS[args.pattern]
+            sampler = ((lambda dx, dy, _f=base_fn: not _f(dx, dy))
+                       if args.invert else base_fn)
+
+        svg_text, n_loops, fill_ratio, n_bridges, recall, precision = generate_svg_cutout(
+            sampler,
+            diameter_mm=args.diameter,
+            grid_n=grid_n,
+            bridge_mm=args.bridge_mm,
+            handle=args.handle,
+            total_width_mm=args.total_width,
+            bulb_diameter_mm=args.bulb_d,
+        )
+        with open(out_path, "w", encoding="utf-8") as fh:
+            fh.write(svg_text)
+
+        cinnamon_g = fill_ratio * 3.0
+        print(
+            f"Saved:  {out_path}  (contour cutout mode)\n"
+            f"  Pattern    : {label}\n"
+            f"  Disk       : ⌀{args.diameter} mm  (design auto-centred)\n"
+            f"  Resolution : {grid_n}×{grid_n}  ({args.diameter/grid_n:.2f} mm/cell)\n"
+            f"  Cut shapes : {n_loops}  ·  {n_bridges} bridges (⌀{args.bridge_mm} mm)\n"
+            f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon\n"
+            f"  Agreement  : {recall*100:.1f}% recall · {precision*100:.1f}% precision\n"
+        )
+        return
+
+    # ── Holes mode (default) ─────────────────────────────────────────────────
+    grid_n = args.grid or 40
+    if args.image:
+        pattern_fn = load_image_pattern(args.image, invert=args.invert)
     else:
         base_fn = PATTERNS[args.pattern]
         if args.invert:
             pattern_fn = lambda nx, ny, _f=base_fn: not _f(nx, ny)
         else:
             pattern_fn = base_fn
-        default_out = f"{args.pattern}_stencil.svg"
-        label       = args.pattern
-
-    out_path = args.output or default_out
 
     # Generate
     svg_text, n_holes, fill_ratio, actual_hole_d = generate_svg(
         pattern_fn,
         diameter_mm=args.diameter,
-        grid_n=args.grid,
+        grid_n=grid_n,
         hole_d_mm=args.hole_d,
         max_fill=args.max_fill,
         handle=args.handle,
@@ -480,7 +921,7 @@ def main():
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(svg_text)
 
-    cell_mm      = args.diameter / args.grid
+    cell_mm      = args.diameter / grid_n
     cinnamon_g   = fill_ratio * 3.0
     scaled_note  = (f"  (auto-scaled from ⌀{args.hole_d} mm to stay within "
                     f"{args.max_fill*100:.0f}% fill cap)"
@@ -489,7 +930,7 @@ def main():
         f"Saved:  {out_path}\n"
         f"  Pattern    : {label}\n"
         f"  Disk       : ⌀{args.diameter} mm\n"
-        f"  Grid       : {args.grid}×{args.grid}  ({cell_mm:.1f} mm/cell)\n"
+        f"  Grid       : {grid_n}×{grid_n}  ({cell_mm:.1f} mm/cell)\n"
         f"  Holes      : {n_holes}  (⌀{actual_hole_d:.2f} mm each){scaled_note}\n"
         f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon per dusting\n"
     )
