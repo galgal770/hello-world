@@ -882,6 +882,8 @@ def main():
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(svg_text)
+        png_path = os.path.splitext(out_path)[0] + ".png"
+        _svg_to_png(os.path.abspath(out_path), png_path)
 
         cinnamon_g = fill_ratio * 3.0
         print(
@@ -920,6 +922,8 @@ def main():
 
     with open(out_path, "w", encoding="utf-8") as fh:
         fh.write(svg_text)
+    png_path = os.path.splitext(out_path)[0] + ".png"
+    _svg_to_png(os.path.abspath(out_path), png_path)
 
     cell_mm      = args.diameter / grid_n
     cinnamon_g   = fill_ratio * 3.0
@@ -934,6 +938,19 @@ def main():
         f"  Holes      : {n_holes}  (⌀{actual_hole_d:.2f} mm each){scaled_note}\n"
         f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon per dusting\n"
     )
+
+
+def _svg_to_png(svg_path, png_path, dpi=150):
+    """Render svg_path → png_path at the given DPI using cairosvg."""
+    try:
+        import cairosvg
+    except ImportError:
+        print("  (PNG skipped — install cairosvg for PNG output: pip install cairosvg)")
+        return
+    # cairosvg scale: SVG is in mm; 1 mm = dpi/25.4 px
+    scale = dpi / 25.4
+    cairosvg.svg2png(url=svg_path, write_to=png_path, scale=scale)
+    print(f"  PNG    : {png_path}  ({dpi} dpi)")
 
 
 def textwrap_dedent(s):
