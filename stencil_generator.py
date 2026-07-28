@@ -361,9 +361,10 @@ def _anchor_white(mask, inside, grid_n):
 
 
 def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
-    """Carve a thin material bridge from every white island to the nearest
-    anchored white cell, so closed counters stay attached.  Mutates `mask`
-    (carved cells become white) and `anchored`.  Returns the bridge count."""
+    """Carve a material bridge from every white island to the nearest anchored
+    white cell, so closed counters stay attached.  Mutates `mask` (carved cells
+    become white) and `anchored`.  Returns (bridge count, carved centre-line
+    paths) — the paths let the caller measure the narrowest wood neck."""
     half = max(0, bridge_cells // 2)
 
     def carve(r, c):
@@ -375,6 +376,7 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
                     anchored[nr][nc] = True
 
     seen = [[False] * grid_n for _ in range(grid_n)]
+    bridge_paths = []
     n_bridges = 0
     for r0 in range(grid_n):
         for c0 in range(grid_n):
@@ -420,13 +422,69 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
             # Carve the path (target → island) and the island itself
             if target is not None:
                 node = target
+                path = []
                 while node is not None:
                     carve(*node)
+                    path.append(node)
                     node = parent[node]
+                bridge_paths.append(path)
                 n_bridges += 1
             for (y, x) in island:        # island is kept material now
                 anchored[y][x] = True
-    return n_bridges
+    return n_bridges, bridge_paths
+
+
+def _dist_to_cut(mask, grid_n):
+    """Two-pass chamfer (3,4) distance from every cell to the nearest CUT cell.
+    Returned in THIRDS of a cell, so divide by 3 to get cells."""
+    BIG = 1 << 30
+    d = [[0 if mask[r][c] else BIG for c in range(grid_n)] for r in range(grid_n)]
+    for r in range(grid_n):
+        row  = d[r]
+        prev = d[r - 1] if r > 0 else None
+        for c in range(grid_n):
+            v = row[c]
+            if v == 0:
+                continue
+            if prev is not None:
+                if c > 0:              v = min(v, prev[c - 1] + 4)
+                v = min(v, prev[c] + 3)
+                if c < grid_n - 1:     v = min(v, prev[c + 1] + 4)
+            if c > 0:                  v = min(v, row[c - 1] + 3)
+            row[c] = v
+    for r in range(grid_n - 1, -1, -1):
+        row = d[r]
+        nxt = d[r + 1] if r < grid_n - 1 else None
+        for c in range(grid_n - 1, -1, -1):
+            v = row[c]
+            if v == 0:
+                continue
+            if nxt is not None:
+                if c < grid_n - 1:     v = min(v, nxt[c + 1] + 4)
+                v = min(v, nxt[c] + 3)
+                if c > 0:              v = min(v, nxt[c - 1] + 4)
+            if c < grid_n - 1:         v = min(v, row[c + 1] + 3)
+            row[c] = v
+    return d
+
+
+def _min_bridge_neck_mm(mask, grid_n, cell_mm, bridge_paths):
+    """Narrowest wood neck along any carved bridge, in mm.
+
+    At a bridge centre-line cell the wood reaches out to the nearest cut cell
+    in either direction, so the neck there spans (2·distance − 1) cells.  The
+    bottleneck is the minimum over every centre-line cell of every bridge.
+    Returns None when the design needed no bridges."""
+    if not bridge_paths:
+        return None
+    d = _dist_to_cut(mask, grid_n)
+    best = None
+    for path in bridge_paths:
+        for (r, c) in path:
+            neck = (2.0 * (d[r][c] / 3.0) - 1.0) * cell_mm
+            if best is None or neck < best:
+                best = neck
+    return best
 
 
 def _count_enclosed(mask, inside, grid_n):
@@ -577,13 +635,16 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
     _remove_small(mask, inside, grid_n, min_cells=3)
     bridge_cells = max(2, round(bridge_mm / cell_mm))
     n_bridges = 0
+    bridge_paths = []
     for _ in range(8):
         anchored = _anchor_white(mask, inside, grid_n)
-        added = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
+        added, paths = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
         n_bridges += added
+        bridge_paths.extend(paths)
         if added == 0:
             break
     n_enclosed = _count_enclosed(mask, inside, grid_n)
+    neck_mm    = _min_bridge_neck_mm(mask, grid_n, cell_mm, bridge_paths)
     loops      = _extract_loops(mask, inside, grid_n)
 
     def corner_mm(X, Y):
@@ -618,10 +679,12 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
         )
         size_note = f"⌀{diameter_mm} mm disk"
 
+    neck_note = (f'  |  narrowest wood neck {neck_mm:.2f} mm'
+                 if neck_mm is not None else '')
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<!-- Coffee Stencil (cutout)  |  {size_note}  |  {len(loops)} cut shapes'
-        f'  |  {n_bridges} bridges  |  {n_enclosed} enclosed islands'
+        f'  |  {n_bridges} bridges  |  {n_enclosed} enclosed islands{neck_note}'
         f'  |  fill {fill_ratio*100:.1f}%  |  agree {recall*100:.1f}% -->',
         '<!-- Generated by stencil_generator.py (contour cutout mode). -->',
         '<!-- Every element below is a CLOSED CONTOUR to cut.  Shapes are hole-free -->',
@@ -645,7 +708,7 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
         '</svg>',
     ]
     return (('\n'.join(lines), len(loops), fill_ratio, n_bridges,
-             recall, precision, n_enclosed))
+             recall, precision, n_enclosed, neck_mm))
 
 
 def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
@@ -868,9 +931,11 @@ def main():
              "is auto-centred in the disk.",
     )
     parser.add_argument(
-        "--bridge-width", dest="bridge_mm", type=float, default=1.6, metavar="MM",
+        "--bridge-width", dest="bridge_mm", type=float, default=3.0, metavar="MM",
         help="Width of the material bridges that hold cut-out islands in place "
-             "(only used with --cutout, default: 1.6).",
+             "(only used with --cutout, default: 3.0).  Keep this at 2.5 mm or "
+             "more: a thinner tab is flimsy in 3 mm ply and the laser kerf can "
+             "eat it away, letting the two cut regions either side merge.",
     )
     parser.add_argument(
         "--content-scale", dest="content_frac", type=float, default=0.85,
@@ -916,7 +981,7 @@ def main():
                        if args.invert else base_fn)
 
         (svg_text, n_loops, fill_ratio, n_bridges, recall, precision,
-         n_enclosed) = generate_svg_cutout(
+         n_enclosed, neck_mm) = generate_svg_cutout(
             sampler,
             diameter_mm=args.diameter,
             grid_n=grid_n,
@@ -933,6 +998,9 @@ def main():
         cinnamon_g = fill_ratio * 3.0
         enclosed_note = ("all interiors bridged ✓" if n_enclosed == 0
                          else f"⚠ {n_enclosed} still enclosed")
+        neck_note = ("no bridges needed" if neck_mm is None
+                     else f"{neck_mm:.2f} mm narrowest wood neck"
+                          + ("" if neck_mm >= 2.0 else "  ⚠ fragile"))
         print(
             f"Saved:  {out_path}  (contour cutout mode)\n"
             f"  Pattern    : {label}\n"
@@ -940,6 +1008,7 @@ def main():
             f"  Resolution : {grid_n}×{grid_n}  ({args.diameter/grid_n:.2f} mm/cell)\n"
             f"  Cut shapes : {n_loops} closed contours  ·  {n_bridges} bridges (⌀{args.bridge_mm} mm)\n"
             f"  Nesting    : {enclosed_note}  (no shape-inside-a-shape)\n"
+            f"  Strength   : {neck_note}\n"
             f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon\n"
             f"  Agreement  : {recall*100:.1f}% recall · {precision*100:.1f}% precision\n"
         )
