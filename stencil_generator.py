@@ -16,8 +16,13 @@ Usage
 Output
 ------
 A single .svg file.  Send it to a laser cutter or CNC router:
-  • Red stroke  (#ff0000) – outer disk outline  → cut / score this line
-  • Blue fill   (#0000ff) – holes               → cut / drill through here
+  • Holes mode  – red disk outline (#ff0000) to score, blue dots (#0000ff)
+    to drill/cut through.
+  • Cutout mode (--cutout) – every element is a CLOSED CONTOUR to cut, with
+    fill off so only the outlines import.  Shapes are guaranteed hole-free:
+    no contour is nested inside another, so a contour-fill cutter removes
+    exactly the drawing and never a shape's interior (e.g. the inside of a
+    cup handle stays attached via a thin bridge).
 
 Recommended settings for a 3 mm thin-ply or 2 mm cardboard disk:
   --diameter 88   (matches a standard espresso / cappuccino cup rim)
@@ -424,6 +429,33 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
     return n_bridges
 
 
+def _count_enclosed(mask, inside, grid_n):
+    """Count 'kept' white regions fully enclosed by cut cells (i.e. not reachable
+    from the disk rim).  Each such region is a shape-inside-a-shape whose centre
+    would drop out of a contour-fill cutter — after bridging this MUST be 0."""
+    anchored = _anchor_white(mask, inside, grid_n)
+    seen = [[False] * grid_n for _ in range(grid_n)]
+    n = 0
+    for r in range(grid_n):
+        for c in range(grid_n):
+            if (not inside[r][c] or mask[r][c] or anchored[r][c]
+                    or seen[r][c]):
+                continue
+            n += 1
+            dq = deque([(r, c)])
+            seen[r][c] = True
+            while dq:
+                y, x = dq.popleft()
+                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                    ny, nx = y + dy, x + dx
+                    if (0 <= ny < grid_n and 0 <= nx < grid_n and inside[ny][nx]
+                            and not mask[ny][nx] and not anchored[ny][nx]
+                            and not seen[ny][nx]):
+                        seen[ny][nx] = True
+                        dq.append((ny, nx))
+    return n
+
+
 def _extract_loops(mask, inside, grid_n):
     """Trace the boundary of the cut region as closed corner loops using
     marching-squares edge segments chained together."""
@@ -535,25 +567,38 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
         bulb_r   = None
 
     # ── Mask → islands → bridges → contours ──────────────────────────────────
+    # Every shape must end up hole-free: a contour-fill cutter treats each closed
+    # path as a solid region, so any kept island enclosed by a cut (the inside of
+    # the cup handle, a letter's counter, …) would be sliced away with it.  We
+    # bridge every enclosed island out to the anchored rim material, repeating
+    # until _count_enclosed() reports zero, so no contour is ever nested inside
+    # another and filling each contour solid reproduces the drawing exactly.
     mask, inside = _build_cut_mask(grid_n, sampler)
     _remove_small(mask, inside, grid_n, min_cells=3)
-    anchored     = _anchor_white(mask, inside, grid_n)
     bridge_cells = max(2, round(bridge_mm / cell_mm))
-    n_bridges    = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
-    loops        = _extract_loops(mask, inside, grid_n)
+    n_bridges = 0
+    for _ in range(8):
+        anchored = _anchor_white(mask, inside, grid_n)
+        added = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
+        n_bridges += added
+        if added == 0:
+            break
+    n_enclosed = _count_enclosed(mask, inside, grid_n)
+    loops      = _extract_loops(mask, inside, grid_n)
 
     def corner_mm(X, Y):
         dx = X / grid_n * 2 - 1
         dy = Y / grid_n * 2 - 1
         return (disk_cx + dx * radius_mm, disk_cy + dy * radius_mm)
 
-    subpaths = []
-    for loop in loops:
+    # One CLOSED CONTOUR per cut region (no even-odd, no fill) so the cutter can
+    # import each shape on its own.
+    cut_paths = []
+    for i, loop in enumerate(loops):
         pts = _chaikin([corner_mm(X, Y) for (X, Y) in loop], iters=2)
         d = "M " + f"{pts[0][0]:.3f} {pts[0][1]:.3f} " + " ".join(
             f"L {x:.3f} {y:.3f}" for x, y in pts[1:]) + " Z"
-        subpaths.append(d)
-    cut_d = " ".join(subpaths)
+        cut_paths.append(f'    <path id="cut{i}" d="{d}"/>')
 
     n_cells    = sum(1 for r in range(grid_n) for c in range(grid_n) if mask[r][c])
     fill_ratio = n_cells * cell_mm ** 2 / disk_area
@@ -562,46 +607,45 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
 
     # ── SVG assembly ─────────────────────────────────────────────────────────
     if handle:
-        outline_svg = (
-            f'  <path d="{_handle_outline_path(disk_cx, disk_cy, radius_mm, bulb_cx, bulb_cy, bulb_r)}"\n'
-            '        fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        outline_shape = (
+            f'<path id="outline" '
+            f'd="{_handle_outline_path(disk_cx, disk_cy, radius_mm, bulb_cx, bulb_cy, bulb_r)}"/>'
         )
         size_note = f"{total_width_mm}×{diameter_mm} mm paddle"
     else:
-        outline_svg = (
-            f'  <circle cx="{disk_cx}" cy="{disk_cy}" r="{radius_mm}"\n'
-            '          fill="none" stroke="#ff0000" stroke-width="0.3"/>'
+        outline_shape = (
+            f'<circle id="outline" cx="{disk_cx}" cy="{disk_cy}" r="{radius_mm}"/>'
         )
         size_note = f"⌀{diameter_mm} mm disk"
 
     lines = [
         '<?xml version="1.0" encoding="UTF-8"?>',
         f'<!-- Coffee Stencil (cutout)  |  {size_note}  |  {len(loops)} cut shapes'
-        f'  |  {n_bridges} bridges  |  fill {fill_ratio*100:.1f}%'
-        f'  |  agree {recall*100:.1f}% -->',
-        '<!-- Generated by stencil_generator.py (contour cutout mode) -->',
+        f'  |  {n_bridges} bridges  |  {n_enclosed} enclosed islands'
+        f'  |  fill {fill_ratio*100:.1f}%  |  agree {recall*100:.1f}% -->',
+        '<!-- Generated by stencil_generator.py (contour cutout mode). -->',
+        '<!-- Every element below is a CLOSED CONTOUR to cut.  Shapes are hole-free -->',
+        '<!-- (no contour nested inside another), so a contour-fill cutter removes  -->',
+        '<!-- exactly the drawing and never a shape\'s interior (e.g. the handle).   -->',
         '<svg xmlns="http://www.w3.org/2000/svg"',
         f'     width="{canvas_w}mm" height="{canvas_h}mm"',
         f'     viewBox="0 0 {canvas_w} {canvas_h}">',
         f'  <title>Coffee Stencil – {size_note} (cutout)</title>',
         '',
-        '  <!-- Outline: RED = laser-cut / score this line -->',
-        outline_svg,
+        '  <!-- Cut lines: fill is OFF so only the contours import into the cutter. -->',
+        '  <g id="cut-contours" fill="none" stroke="#000000" stroke-width="0.3"',
+        '     stroke-linejoin="round">',
         '',
-        '  <!-- Cut regions: RED outline = cut path, BLUE fill = removed material -->',
-        f'  <path d="{cut_d}"',
-        '        fill="#0000ff" fill-opacity="0.85" fill-rule="evenodd"',
-        '        stroke="#ff0000" stroke-width="0.25"/>',
+        '    <!-- Paddle / disk silhouette (cut this last) -->',
+        f'    {outline_shape}',
         '',
-        f'  <text x="{disk_cx}" y="{canvas_h - 1.5}"',
-        '        text-anchor="middle" font-family="sans-serif"',
-        '        font-size="2.5" fill="#999999">',
-        f'    {size_note} · {len(loops)} shapes · {n_bridges} bridges'
-        f' · fill {fill_ratio*100:.1f}% · agree {recall*100:.1f}% · ~{cinnamon_g:.1f} g cinnamon',
-        '  </text>',
+        '    <!-- Design cut-outs, one closed contour each -->',
+        *cut_paths,
+        '  </g>',
         '</svg>',
     ]
-    return '\n'.join(lines), len(loops), fill_ratio, n_bridges, recall, precision
+    return (('\n'.join(lines), len(loops), fill_ratio, n_bridges,
+             recall, precision, n_enclosed))
 
 
 def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
@@ -871,7 +915,8 @@ def main():
             sampler = ((lambda dx, dy, _f=base_fn: not _f(dx, dy))
                        if args.invert else base_fn)
 
-        svg_text, n_loops, fill_ratio, n_bridges, recall, precision = generate_svg_cutout(
+        (svg_text, n_loops, fill_ratio, n_bridges, recall, precision,
+         n_enclosed) = generate_svg_cutout(
             sampler,
             diameter_mm=args.diameter,
             grid_n=grid_n,
@@ -886,12 +931,15 @@ def main():
         _svg_to_png(os.path.abspath(out_path), png_path)
 
         cinnamon_g = fill_ratio * 3.0
+        enclosed_note = ("all interiors bridged ✓" if n_enclosed == 0
+                         else f"⚠ {n_enclosed} still enclosed")
         print(
             f"Saved:  {out_path}  (contour cutout mode)\n"
             f"  Pattern    : {label}\n"
             f"  Disk       : ⌀{args.diameter} mm  (design auto-centred)\n"
             f"  Resolution : {grid_n}×{grid_n}  ({args.diameter/grid_n:.2f} mm/cell)\n"
-            f"  Cut shapes : {n_loops}  ·  {n_bridges} bridges (⌀{args.bridge_mm} mm)\n"
+            f"  Cut shapes : {n_loops} closed contours  ·  {n_bridges} bridges (⌀{args.bridge_mm} mm)\n"
+            f"  Nesting    : {enclosed_note}  (no shape-inside-a-shape)\n"
             f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon\n"
             f"  Agreement  : {recall*100:.1f}% recall · {precision*100:.1f}% precision\n"
         )
