@@ -572,6 +572,71 @@ def _chaikin(pts, iters=2):
     return pts
 
 
+def _rdp_open(seq, eps):
+    """Douglas–Peucker simplification of an OPEN polyline (iterative, so long
+    contours can't blow the recursion limit)."""
+    n = len(seq)
+    if n < 3:
+        return list(seq)
+    keep = [False] * n
+    keep[0] = keep[n - 1] = True
+    stack = [(0, n - 1)]
+    while stack:
+        i, j = stack.pop()
+        if j <= i + 1:
+            continue
+        x0, y0 = seq[i]
+        x1, y1 = seq[j]
+        dx, dy = x1 - x0, y1 - y0
+        L = math.hypot(dx, dy)
+        imax, dmax = -1, -1.0
+        for k in range(i + 1, j):
+            x, y = seq[k]
+            d = (math.hypot(x - x0, y - y0) if L < 1e-12
+                 else abs(dy * (x - x0) - dx * (y - y0)) / L)
+            if d > dmax:
+                dmax, imax = d, k
+        if dmax > eps and imax > 0:
+            keep[imax] = True
+            stack.append((i, imax))
+            stack.append((imax, j))
+    return [seq[k] for k in range(n) if keep[k]]
+
+
+def _rdp_closed(pts, eps):
+    """Douglas–Peucker simplification of a CLOSED polygon.  Marching squares
+    walks the cell edges, so every traced contour is a staircase of 90° steps;
+    simplifying with a tolerance of a fraction of a millimetre collapses those
+    steps onto the line the artwork actually followed."""
+    n = len(pts)
+    if n < 8:
+        return list(pts)
+    half = n // 2
+    a = _rdp_open(pts[:half + 1], eps)
+    b = _rdp_open(pts[half:] + [pts[0]], eps)
+    out = a[:-1] + b[:-1]
+    return out if len(out) >= 4 else list(pts)
+
+
+def _bezier_path(pts):
+    """Closed cubic-Bézier path through `pts` (Catmull–Rom converted to Bézier).
+    The curve interpolates every point and is C1-continuous, so the cut reads as
+    one flowing line instead of a chain of straight segments."""
+    n = len(pts)
+    d = [f"M {pts[0][0]:.3f} {pts[0][1]:.3f}"]
+    for i in range(n):
+        p0 = pts[(i - 1) % n]
+        p1 = pts[i]
+        p2 = pts[(i + 1) % n]
+        p3 = pts[(i + 2) % n]
+        c1 = (p1[0] + (p2[0] - p0[0]) / 6.0, p1[1] + (p2[1] - p0[1]) / 6.0)
+        c2 = (p2[0] - (p3[0] - p1[0]) / 6.0, p2[1] - (p3[1] - p1[1]) / 6.0)
+        d.append(f"C {c1[0]:.3f} {c1[1]:.3f}, {c2[0]:.3f} {c2[1]:.3f},"
+                 f" {p2[0]:.3f} {p2[1]:.3f}")
+    d.append("Z")
+    return " ".join(d)
+
+
 def _cut_agreement(sampler, mask, grid_n, fine=400):
     """Recall/precision of the cut region vs. the original design (in-disk)."""
     cov = orig = cut = 0
@@ -593,8 +658,9 @@ def _cut_agreement(sampler, mask, grid_n, fine=400):
     return recall, prec
 
 
-def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
-                        handle=False, total_width_mm=None, bulb_diameter_mm=None):
+def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=3.0,
+                        handle=False, total_width_mm=None, bulb_diameter_mm=None,
+                        smooth_mm=0.15):
     """Build SVG text for a contour-cut stencil (solid areas cut out, with
     auto-bridges holding every closed counter).  The design is centred in the
     big disk by the sampler's own transform.
@@ -655,11 +721,13 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=1.6,
     # One CLOSED CONTOUR per cut region (no even-odd, no fill) so the cutter can
     # import each shape on its own.
     cut_paths = []
+    n_nodes = 0
     for i, loop in enumerate(loops):
-        pts = _chaikin([corner_mm(X, Y) for (X, Y) in loop], iters=2)
-        d = "M " + f"{pts[0][0]:.3f} {pts[0][1]:.3f} " + " ".join(
-            f"L {x:.3f} {y:.3f}" for x, y in pts[1:]) + " Z"
-        cut_paths.append(f'    <path id="cut{i}" d="{d}"/>')
+        pts = [corner_mm(X, Y) for (X, Y) in loop]
+        pts = _rdp_closed(pts, smooth_mm)   # collapse the marching-squares steps
+        pts = _chaikin(pts, iters=1)        # relax the remaining corners
+        n_nodes += len(pts)
+        cut_paths.append(f'    <path id="cut{i}" d="{_bezier_path(pts)}"/>')
 
     n_cells    = sum(1 for r in range(grid_n) for c in range(grid_n) if mask[r][c])
     fill_ratio = n_cells * cell_mm ** 2 / disk_area
@@ -938,6 +1006,15 @@ def main():
              "eat it away, letting the two cut regions either side merge.",
     )
     parser.add_argument(
+        "--smooth", dest="smooth_mm", type=float, default=0.15, metavar="MM",
+        help="Contour smoothing tolerance in mm (only used with --cutout, "
+             "default: 0.15).  Contours are traced on the grid and so come out "
+             "as 90° staircases; they are simplified to within this tolerance "
+             "and emitted as cubic Béziers, which removes the pixelation.  "
+             "Raise it for smoother/softer curves, lower it to track the "
+             "artwork more literally.",
+    )
+    parser.add_argument(
         "--content-scale", dest="content_frac", type=float, default=0.85,
         metavar="FRAC",
         help="Fraction of the disk radius the design fills when auto-centred "
@@ -989,6 +1066,7 @@ def main():
             handle=args.handle,
             total_width_mm=args.total_width,
             bulb_diameter_mm=args.bulb_d,
+            smooth_mm=args.smooth_mm,
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(svg_text)
