@@ -360,20 +360,50 @@ def _anchor_white(mask, inside, grid_n):
     return anchored
 
 
+def _carve_capsule(mask, inside, anchored, grid_n, p, q, radius):
+    """Carve a capsule — the segment p→q dilated by a disc of `radius` cells —
+    turning those cells back into wood.
+
+    Sweeping an axis-aligned SQUARE along a 4-connected staircase (the previous
+    approach) left a blunt, ragged notch that ran diagonally across the stroke
+    and grew spurs where the staircase turned.  A capsule is straight, of
+    constant width, and closes with circular arcs, so the two stroke ends left
+    behind read as a deliberate pen lift rather than as damage.
+
+    Carving only ever turns cut cells back into wood, so it can never merge two
+    separate cut shapes — at worst it interrupts the one stroke it crosses,
+    which is exactly the intent.
+    """
+    (r0, c0), (r1, c1) = p, q
+    dr, dc = r1 - r0, c1 - c0
+    seg2 = dr * dr + dc * dc
+    pad = int(math.ceil(radius)) + 1
+    for r in range(max(0, min(r0, r1) - pad), min(grid_n, max(r0, r1) + pad + 1)):
+        for c in range(max(0, min(c0, c1) - pad), min(grid_n, max(c0, c1) + pad + 1)):
+            if not inside[r][c]:
+                continue
+            if seg2 == 0:
+                t = 0.0
+            else:
+                t = ((r - r0) * dr + (c - c0) * dc) / seg2
+                t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            fr, fc = r0 + t * dr, c0 + t * dc
+            if (r - fr) ** 2 + (c - fc) ** 2 <= radius * radius:
+                mask[r][c] = False
+                if anchored is not None:
+                    anchored[r][c] = True
+
+
 def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
     """Carve a material bridge from every white island to the nearest anchored
     white cell, so closed counters stay attached.  Mutates `mask` (carved cells
     become white) and `anchored`.  Returns (bridge count, carved centre-line
-    paths) — the paths let the caller measure the narrowest wood neck."""
-    half = max(0, bridge_cells // 2)
+    paths) — the paths let the caller measure the narrowest wood neck.
 
-    def carve(r, c):
-        for dr in range(-half, half + 1):
-            for dc in range(-half, half + 1):
-                nr, nc = r + dr, c + dc
-                if 0 <= nr < grid_n and 0 <= nc < grid_n and inside[nr][nc]:
-                    mask[nr][nc] = False
-                    anchored[nr][nc] = True
+    The bridge follows the SHORTEST crossing of the cut band, which is very
+    nearly perpendicular to the stroke, and is carved as one clean capsule.
+    """
+    radius = bridge_cells / 2.0
 
     seen = [[False] * grid_n for _ in range(grid_n)]
     bridge_paths = []
@@ -419,15 +449,21 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
                         break
                     frontier.append((ny, nx))
 
-            # Carve the path (target → island) and the island itself
+            # Carve one straight capsule across the band, island → anchored wood
             if target is not None:
-                node = target
-                path = []
+                node, chain = target, []
                 while node is not None:
-                    carve(*node)
-                    path.append(node)
+                    chain.append(node)
                     node = parent[node]
-                bridge_paths.append(path)
+                src = chain[-1]          # the island end of the crossing
+                _carve_capsule(mask, inside, anchored, grid_n, src, target, radius)
+                # Sample the capsule's centre line so the neck can be measured.
+                span = int(math.hypot(target[0] - src[0], target[1] - src[1]))
+                steps = max(2, span + 1)
+                bridge_paths.append([
+                    (int(round(src[0] + s / steps * (target[0] - src[0]))),
+                     int(round(src[1] + s / steps * (target[1] - src[1]))))
+                    for s in range(steps + 1)])
                 n_bridges += 1
             for (y, x) in island:        # island is kept material now
                 anchored[y][x] = True
@@ -435,8 +471,16 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
 
 
 def _dist_to_cut(mask, grid_n):
-    """Two-pass chamfer (3,4) distance from every cell to the nearest CUT cell.
-    Returned in THIRDS of a cell, so divide by 3 to get cells."""
+    """Chamfer distance from every cell to the nearest CUT cell, in thirds of a
+    cell.  For a wood cell that is its distance to the edge of the nearest hole,
+    so twice it (less one cell) is the width of the wood there."""
+    return _chamfer(mask, grid_n)
+
+
+def _chamfer(seeds, grid_n):
+    """Two-pass chamfer (3,4) distance from every cell to the nearest True cell
+    of `seeds`.  Returned in THIRDS of a cell, so divide by 3 to get cells."""
+    mask = seeds
     BIG = 1 << 30
     d = [[0 if mask[r][c] else BIG for c in range(grid_n)] for r in range(grid_n)]
     for r in range(grid_n):
@@ -466,6 +510,103 @@ def _dist_to_cut(mask, grid_n):
             if c < grid_n - 1:         v = min(v, row[c + 1] + 3)
             row[c] = v
     return d
+
+
+def _thin_links(mask, inside, grid_n, cell_mm, min_mm, widen=False, rounds=4):
+    """Find — and optionally widen — wood that is the SOLE link between two wood
+    regions yet thinner than `min_mm`.
+
+    A bridge can be full width and the stencil still fail: where two lines of
+    the artwork happen to run close, the sliver of wood between them is just as
+    fragile, merges under the laser kerf, and drops whatever it was holding.
+
+    Stroke tips are deliberately left alone.  Only pinch points — where wood
+    grown out from two DIFFERENT thick regions meets — are widened, so tapering
+    terminals keep their points and the lettering is not blunted.
+
+    Returns the number of pinch points widened.
+    """
+    r_cells = (min_mm / 2.0) / cell_mm
+    fixed = 0
+    for _ in range(rounds):
+        wood = [[inside[r][c] and not mask[r][c] for c in range(grid_n)]
+                for r in range(grid_n)]
+        d = _chamfer(mask, grid_n)
+        # "Thick" wood = a disc of diameter min_mm fits here.
+        thick = [[wood[r][c] and d[r][c] / 3.0 >= r_cells
+                  for c in range(grid_n)] for r in range(grid_n)]
+
+        label = [[0] * grid_n for _ in range(grid_n)]
+        k = 0
+        for r in range(grid_n):
+            for c in range(grid_n):
+                if not thick[r][c] or label[r][c]:
+                    continue
+                k += 1
+                dq = deque([(r, c)])
+                label[r][c] = k
+                while dq:
+                    y, x = dq.popleft()
+                    for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                        ny, nx = y + dy, x + dx
+                        if (0 <= ny < grid_n and 0 <= nx < grid_n
+                                and thick[ny][nx] and not label[ny][nx]):
+                            label[ny][nx] = k
+                            dq.append((ny, nx))
+        if k < 2:
+            break
+
+        # Grow each thick region outwards over the thin wood; every wood cell
+        # ends up owned by its nearest thick region.
+        dq = deque((r, c) for r in range(grid_n) for c in range(grid_n)
+                   if label[r][c])
+        while dq:
+            y, x = dq.popleft()
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if (0 <= ny < grid_n and 0 <= nx < grid_n and wood[ny][nx]
+                        and not label[ny][nx]):
+                    label[ny][nx] = label[y][x]
+                    dq.append((ny, nx))
+
+        # Where two different owners touch, the wood between them is a pinch.
+        pinch = []
+        for r in range(grid_n):
+            for c in range(grid_n):
+                if not label[r][c]:
+                    continue
+                for dy, dx in ((1, 0), (0, 1)):
+                    ny, nx = r + dy, c + dx
+                    if (ny < grid_n and nx < grid_n and label[ny][nx]
+                            and label[ny][nx] != label[r][c]):
+                        pinch.append((r, c))
+                        break
+        if not pinch:
+            break
+
+        # Count distinct pinch SITES, not cells: one isthmus shows up as a whole
+        # cross-section of meeting cells.
+        pset, seen_p, sites = set(pinch), set(), 0
+        for p in pset:
+            if p in seen_p:
+                continue
+            sites += 1
+            dq = deque([p])
+            seen_p.add(p)
+            while dq:
+                y, x = dq.popleft()
+                for dy in (-1, 0, 1):
+                    for dx in (-1, 0, 1):
+                        q = (y + dy, x + dx)
+                        if q in pset and q not in seen_p:
+                            seen_p.add(q)
+                            dq.append(q)
+        if not widen:
+            return sites                      # detection only; artwork untouched
+        for (r, c) in pinch:
+            _carve_capsule(mask, inside, None, grid_n, (r, c), (r, c), r_cells)
+        fixed += sites
+    return fixed
 
 
 def _min_bridge_neck_mm(mask, grid_n, cell_mm, bridge_paths):
@@ -658,9 +799,9 @@ def _cut_agreement(sampler, mask, grid_n, fine=400):
     return recall, prec
 
 
-def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=3.0,
+def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=2.4,
                         handle=False, total_width_mm=None, bulb_diameter_mm=None,
-                        smooth_mm=0.15):
+                        smooth_mm=0.15, min_wood_mm=2.0):
     """Build SVG text for a contour-cut stencil (solid areas cut out, with
     auto-bridges holding every closed counter).  The design is centred in the
     big disk by the sampler's own transform.
@@ -709,6 +850,31 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=3.0,
         bridge_paths.extend(paths)
         if added == 0:
             break
+    # A bridge can still end up thinner than asked for: where the crossing runs
+    # close to a NEIGHBOURING hole, that hole pinches the wood even though the
+    # capsule itself is full width — and two cut lines that close together merge
+    # under the kerf.  Widen any short bridge until it measures up (widening also
+    # pushes back the neighbouring hole, since carving turns cut cells to wood).
+    extra = 0
+    for _ in range(6):
+        d = _dist_to_cut(mask, grid_n)
+        short = [p for p in bridge_paths
+                 if min((2.0 * (d[r][c] / 3.0) - 1.0) * cell_mm for (r, c) in p)
+                 < bridge_mm - 0.5 * cell_mm]
+        if not short:
+            break
+        extra += 1
+        anchored = _anchor_white(mask, inside, grid_n)
+        for p in short:
+            _carve_capsule(mask, inside, anchored, grid_n, p[0], p[-1],
+                           bridge_cells / 2.0 + extra)
+
+    # Same failure, different cause: where two lines of the artwork run close,
+    # the sliver between them is as fragile as an undersized bridge.
+    widen   = bool(min_wood_mm and min_wood_mm > 0)
+    n_pinch = _thin_links(mask, inside, grid_n, cell_mm,
+                          min_wood_mm if widen else 2.0, widen=widen)
+
     n_enclosed = _count_enclosed(mask, inside, grid_n)
     neck_mm    = _min_bridge_neck_mm(mask, grid_n, cell_mm, bridge_paths)
     loops      = _extract_loops(mask, inside, grid_n)
@@ -776,7 +942,7 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=3.0,
         '</svg>',
     ]
     return (('\n'.join(lines), len(loops), fill_ratio, n_bridges,
-             recall, precision, n_enclosed, neck_mm))
+             recall, precision, n_enclosed, neck_mm, n_pinch))
 
 
 def generate_svg(pattern_fn, diameter_mm=90.0, grid_n=40, hole_d_mm=1.5,
@@ -999,11 +1165,13 @@ def main():
              "is auto-centred in the disk.",
     )
     parser.add_argument(
-        "--bridge-width", dest="bridge_mm", type=float, default=3.0, metavar="MM",
+        "--bridge-width", dest="bridge_mm", type=float, default=2.4, metavar="MM",
         help="Width of the material bridges that hold cut-out islands in place "
-             "(only used with --cutout, default: 3.0).  Keep this at 2.5 mm or "
-             "more: a thinner tab is flimsy in 3 mm ply and the laser kerf can "
-             "eat it away, letting the two cut regions either side merge.",
+             "(only used with --cutout, default: 2.4).  Each bridge is carved as "
+             "a straight capsule across the THINNEST crossing of the stroke, so "
+             "it reads as a pen lift rather than a notch.  Don't go below ~2 mm: "
+             "the laser kerf eats ~0.2 mm per side, and a 1.6 mm bridge has been "
+             "observed to burn away entirely and drop the part it was holding.",
     )
     parser.add_argument(
         "--smooth", dest="smooth_mm", type=float, default=0.15, metavar="MM",
@@ -1013,6 +1181,16 @@ def main():
              "and emitted as cubic Béziers, which removes the pixelation.  "
              "Raise it for smoother/softer curves, lower it to track the "
              "artwork more literally.",
+    )
+    parser.add_argument(
+        "--min-wood", dest="min_wood_mm", type=float, default=0.0, metavar="MM",
+        help="Minimum width of wood that is the sole link between two regions "
+             "(only used with --cutout, default: 2.0).  Where two lines of the "
+             "artwork run this close, the sliver between them merges under the "
+             "kerf and drops whatever it held.  Default 0 = report only, so the "
+             "artwork is reproduced untouched; set e.g. 2.0 to carve the "
+             "neighbouring holes back until such links measure up (this trims "
+             "the design, so check the agreement figure).  Tips stay pointed.",
     )
     parser.add_argument(
         "--content-scale", dest="content_frac", type=float, default=0.85,
@@ -1058,7 +1236,7 @@ def main():
                        if args.invert else base_fn)
 
         (svg_text, n_loops, fill_ratio, n_bridges, recall, precision,
-         n_enclosed, neck_mm) = generate_svg_cutout(
+         n_enclosed, neck_mm, n_pinch) = generate_svg_cutout(
             sampler,
             diameter_mm=args.diameter,
             grid_n=grid_n,
@@ -1067,6 +1245,7 @@ def main():
             total_width_mm=args.total_width,
             bulb_diameter_mm=args.bulb_d,
             smooth_mm=args.smooth_mm,
+            min_wood_mm=args.min_wood_mm,
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(svg_text)
@@ -1076,6 +1255,14 @@ def main():
         cinnamon_g = fill_ratio * 3.0
         enclosed_note = ("all interiors bridged ✓" if n_enclosed == 0
                          else f"⚠ {n_enclosed} still enclosed")
+        if args.min_wood_mm and args.min_wood_mm > 0:
+            thin_note = (f"{n_pinch} pinch point(s) widened to "
+                         f"{args.min_wood_mm} mm")
+        elif n_pinch:
+            thin_note = (f"⚠ {n_pinch} link(s) under 2.0 mm — artwork left as "
+                         f"drawn; pass --min-wood to widen")
+        else:
+            thin_note = "no link under 2.0 mm  ✓"
         neck_note = ("no bridges needed" if neck_mm is None
                      else f"{neck_mm:.2f} mm narrowest wood neck"
                           + ("" if neck_mm >= 2.0 else "  ⚠ fragile"))
@@ -1087,6 +1274,7 @@ def main():
             f"  Cut shapes : {n_loops} closed contours  ·  {n_bridges} bridges (⌀{args.bridge_mm} mm)\n"
             f"  Nesting    : {enclosed_note}  (no shape-inside-a-shape)\n"
             f"  Strength   : {neck_note}\n"
+            f"  Thin wood  : {thin_note}\n"
             f"  Fill ratio : {fill_ratio*100:.1f}%  →  ~{cinnamon_g:.1f} g cinnamon\n"
             f"  Agreement  : {recall*100:.1f}% recall · {precision*100:.1f}% precision\n"
         )
