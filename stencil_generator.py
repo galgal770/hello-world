@@ -394,16 +394,108 @@ def _carve_capsule(mask, inside, anchored, grid_n, p, q, radius):
                     anchored[r][c] = True
 
 
-def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
-    """Carve a material bridge from every white island to the nearest anchored
-    white cell, so closed counters stay attached.  Mutates `mask` (carved cells
-    become white) and `anchored`.  Returns (bridge count, carved centre-line
-    paths) — the paths let the caller measure the narrowest wood neck.
+def _oblique_span(p, q, angle_deg, radius):
+    """Slant the crossing p->q by `angle_deg` about its midpoint.
 
-    The bridge follows the SHORTEST crossing of the cut band, which is very
-    nearly perpendicular to the stroke, and is carved as one clean capsule.
+    A cut taken square across a stroke leaves two blunt, flat ends.  Running it
+    at an angle leaves two wedges that taper to a point instead — the way a
+    brush lifts off the paper — which is exactly how the breaks already drawn
+    into the artwork look.  The span is lengthened by 1/cos(angle) so the slanted
+    cut still crosses the whole stroke.
+    """
+    if not angle_deg:
+        return p, q
+    dr, dc = q[0] - p[0], q[1] - p[1]
+    ln = math.hypot(dr, dc)
+    if ln < 1e-9:
+        return p, q
+    nr, nc = dr / ln, dc / ln          # across the stroke
+    tr, tc = -nc, nr                   # along the stroke
+    th = math.radians(angle_deg)
+    ur = nr * math.cos(th) + tr * math.sin(th)
+    uc = nc * math.cos(th) + tc * math.sin(th)
+    half = ln / 2.0 / max(0.25, math.cos(th)) + radius + 1.0
+    mr, mc = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
+    return ((int(round(mr - half * ur)), int(round(mc - half * uc))),
+            (int(round(mr + half * ur)), int(round(mc + half * uc))))
+
+
+def _add_bridges(mask, inside, anchored, grid_n, bridge_cells,
+                 side="auto", angle_deg=0.0):
+    """Carve a material bridge from every white island to the anchored wood, so
+    closed counters stay attached.  Mutates `mask` (carved cells become wood)
+    and `anchored`.  Returns (bridge count, carved centre-line paths).
+
+    `side` biases WHERE the break is put — among crossings nearly as thin as the
+    thinnest, the one furthest toward that edge of the island wins, so the break
+    can be placed where it reads best.  `angle_deg` slants the cut so the stroke
+    ends taper instead of stopping square.
     """
     radius = bridge_cells / 2.0
+    INF = 1 << 30
+
+    # Steps from every cell to the nearest anchored wood cell.  For a cell in an
+    # island that is the length of the crossing it would need.
+    D = [[INF] * grid_n for _ in range(grid_n)]
+    dq = deque()
+    for r in range(grid_n):
+        for c in range(grid_n):
+            if inside[r][c] and anchored[r][c]:
+                D[r][c] = 0
+                dq.append((r, c))
+    while dq:
+        y, x = dq.popleft()
+        for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            ny, nx = y + dy, x + dx
+            if (0 <= ny < grid_n and 0 <= nx < grid_n and inside[ny][nx]
+                    and D[ny][nx] == INF):
+                D[ny][nx] = D[y][x] + 1
+                dq.append((ny, nx))
+
+    def pick(cells):
+        best = min(D[r][c] for (r, c) in cells)
+        tol = best + max(2, int(round(best * 0.6)))
+        near = [(r, c) for (r, c) in cells if D[r][c] <= tol]
+        if side == "bottom":
+            return max(near, key=lambda rc: rc[0])
+        if side == "top":
+            return min(near, key=lambda rc: rc[0])
+        if side == "right":
+            return max(near, key=lambda rc: rc[1])
+        if side == "left":
+            return min(near, key=lambda rc: rc[1])
+        return min(near, key=lambda rc: D[rc[0]][rc[1]])
+
+    def downhill(start):
+        r, c = start
+        while D[r][c] > 0:
+            step = None
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = r + dy, c + dx
+                if (0 <= ny < grid_n and 0 <= nx < grid_n
+                        and D[ny][nx] == D[r][c] - 1):
+                    step = (ny, nx)
+                    break
+            if step is None:
+                break
+            r, c = step
+        return (r, c)
+
+    def connects(start):
+        """Did the carve actually join `start` to wood that was already held?"""
+        seen_w = {start}
+        dq2 = deque([start])
+        while dq2:
+            y, x = dq2.popleft()
+            if D[y][x] == 0:
+                return True
+            for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                ny, nx = y + dy, x + dx
+                if (0 <= ny < grid_n and 0 <= nx < grid_n and inside[ny][nx]
+                        and not mask[ny][nx] and (ny, nx) not in seen_w):
+                    seen_w.add((ny, nx))
+                    dq2.append((ny, nx))
+        return False
 
     seen = [[False] * grid_n for _ in range(grid_n)]
     bridge_paths = []
@@ -413,12 +505,11 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
             if (not inside[r0][c0] or mask[r0][c0] or anchored[r0][c0]
                     or seen[r0][c0]):
                 continue
-            # Collect this island (4-connected white, not anchored)
             island = []
-            dq = deque([(r0, c0)])
+            dq3 = deque([(r0, c0)])
             seen[r0][c0] = True
-            while dq:
-                y, x = dq.popleft()
+            while dq3:
+                y, x = dq3.popleft()
                 island.append((y, x))
                 for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
                     ny, nx = y + dy, x + dx
@@ -426,49 +517,29 @@ def _add_bridges(mask, inside, anchored, grid_n, bridge_cells):
                             and not mask[ny][nx] and not anchored[ny][nx]
                             and not seen[ny][nx]):
                         seen[ny][nx] = True
-                        dq.append((ny, nx))
+                        dq3.append((ny, nx))
 
-            # BFS through the grid from the island to the nearest anchored cell
-            parent = {}
-            frontier = deque()
-            for cell in island:
-                parent[cell] = None
-                frontier.append(cell)
-            target = None
-            while frontier and target is None:
-                y, x = frontier.popleft()
-                for dy, dx in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    ny, nx = y + dy, x + dx
-                    if not (0 <= ny < grid_n and 0 <= nx < grid_n) or not inside[ny][nx]:
-                        continue
-                    if (ny, nx) in parent:
-                        continue
-                    parent[(ny, nx)] = (y, x)
-                    if anchored[ny][nx]:
-                        target = (ny, nx)
-                        break
-                    frontier.append((ny, nx))
-
-            # Carve one straight capsule across the band, island → anchored wood
-            if target is not None:
-                node, chain = target, []
-                while node is not None:
-                    chain.append(node)
-                    node = parent[node]
-                src = chain[-1]          # the island end of the crossing
-                _carve_capsule(mask, inside, anchored, grid_n, src, target, radius)
-                # Sample the capsule's centre line so the neck can be measured.
-                span = int(math.hypot(target[0] - src[0], target[1] - src[1]))
+            reachable = [rc for rc in island if D[rc[0]][rc[1]] < INF]
+            if reachable:
+                p = pick(reachable)
+                q = downhill(p)
+                A, B = _oblique_span(p, q, angle_deg, radius)
+                _carve_capsule(mask, inside, anchored, grid_n, A, B, radius)
+                if not connects(p):
+                    # The slanted cut missed the wood on one side; fall back to
+                    # the square crossing, which always spans it.
+                    _carve_capsule(mask, inside, anchored, grid_n, p, q, radius)
+                    A, B = p, q
+                span = int(math.hypot(B[0] - A[0], B[1] - A[1]))
                 steps = max(2, span + 1)
                 bridge_paths.append([
-                    (int(round(src[0] + s / steps * (target[0] - src[0]))),
-                     int(round(src[1] + s / steps * (target[1] - src[1]))))
+                    (int(round(A[0] + s / steps * (B[0] - A[0]))),
+                     int(round(A[1] + s / steps * (B[1] - A[1]))))
                     for s in range(steps + 1)])
                 n_bridges += 1
-            for (y, x) in island:        # island is kept material now
+            for (y, x) in island:
                 anchored[y][x] = True
     return n_bridges, bridge_paths
-
 
 def _dist_to_cut(mask, grid_n):
     """Chamfer distance from every cell to the nearest CUT cell, in thirds of a
@@ -801,7 +872,8 @@ def _cut_agreement(sampler, mask, grid_n, fine=400):
 
 def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=2.4,
                         handle=False, total_width_mm=None, bulb_diameter_mm=None,
-                        smooth_mm=0.15, min_wood_mm=2.0):
+                        smooth_mm=0.15, min_wood_mm=2.0,
+                        bridge_side="auto", bridge_angle=0.0):
     """Build SVG text for a contour-cut stencil (solid areas cut out, with
     auto-bridges holding every closed counter).  The design is centred in the
     big disk by the sampler's own transform.
@@ -845,7 +917,9 @@ def generate_svg_cutout(sampler, diameter_mm=95.0, grid_n=300, bridge_mm=2.4,
     bridge_paths = []
     for _ in range(8):
         anchored = _anchor_white(mask, inside, grid_n)
-        added, paths = _add_bridges(mask, inside, anchored, grid_n, bridge_cells)
+        added, paths = _add_bridges(mask, inside, anchored, grid_n,
+                                    bridge_cells, side=bridge_side,
+                                    angle_deg=bridge_angle)
         n_bridges += added
         bridge_paths.extend(paths)
         if added == 0:
@@ -1183,6 +1257,22 @@ def main():
              "artwork more literally.",
     )
     parser.add_argument(
+        "--bridge-side", dest="bridge_side", default="auto",
+        choices=("auto", "top", "bottom", "left", "right"),
+        help="Where to put each bridge (only with --cutout, default: auto). "
+             "'auto' takes the thinnest crossing; the others take the thinnest "
+             "crossing that also sits furthest toward that edge, so the break "
+             "can be placed where it reads best in the drawing.",
+    )
+    parser.add_argument(
+        "--bridge-angle", dest="bridge_angle", type=float, default=0.0,
+        metavar="DEG",
+        help="Slant of the bridge cut in degrees (only with --cutout, default: "
+             "0 = square across the stroke).  A slanted cut leaves the two "
+             "stroke ends tapering to a point, like a brush lifting off, "
+             "instead of stopping blunt.  40-60 reads well.",
+    )
+    parser.add_argument(
         "--min-wood", dest="min_wood_mm", type=float, default=0.0, metavar="MM",
         help="Minimum width of wood that is the sole link between two regions "
              "(only used with --cutout, default: 2.0).  Where two lines of the "
@@ -1246,6 +1336,8 @@ def main():
             bulb_diameter_mm=args.bulb_d,
             smooth_mm=args.smooth_mm,
             min_wood_mm=args.min_wood_mm,
+            bridge_side=args.bridge_side,
+            bridge_angle=args.bridge_angle,
         )
         with open(out_path, "w", encoding="utf-8") as fh:
             fh.write(svg_text)
